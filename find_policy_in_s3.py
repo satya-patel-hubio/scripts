@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Fast S3 scan: find .txt objects where any *data* line has policy number in cols 6–23.
+Fast S3 scan: find .txt objects where any *data* line has policy number(s) in cols 6–23.
+- Accepts a single policy number or comma-separated list.
 - Skips first and last line (metadata) without loading whole file (stream + lag buffer).
-- Parallelizes S3 GETs (biggest speedup).
-- Early-exits per object as soon as a match is found.
+- Parallelizes S3 GETs. One pass per file checks all requested policies.
+- Prints each file as it is searched; final output grouped by policy number.
 """
 
 from __future__ import annotations
@@ -16,58 +17,54 @@ import boto3
 import botocore
 from botocore.config import Config
 
-# Policy number is ONLY the 18-character field at positions 6–23 (1-indexed).
-# E.g. in "155396H1096926..." the policy number is "6H1096926" (positions 6–23), not "155396H1096926".
-POLICY_SLICE = slice(5, 23)  # positions 6–23 inclusive (1-indexed)
+POLICY_SLICE = slice(5, 23) 
 
 def normalize_policy(s: str) -> str:
     return s.strip().replace(" ", "")
 
-def line_matches_policy(line: str, want: str) -> bool:
+def policy_in_line(line: str) -> Optional[str]:
+    """Return normalized policy from line (cols 6–23) or None."""
     if len(line) < POLICY_SLICE.stop:
-        return False
-    field = line[POLICY_SLICE]
-    return normalize_policy(field) == want
+        return None
+    return normalize_policy(line[POLICY_SLICE])
 
-def object_contains_policy_streaming(s3, bucket: str, key: str, want: str) -> bool:
+def object_matching_policies_streaming(
+    s3, bucket: str, key: str, want_set: set[str]
+) -> set[str]:
     """
-    Stream object line-by-line. Skip first and last line (metadata) using lag buffer:
-      - discard first line
-      - keep one previous line; only evaluate it once you read the next line
-      - never evaluate the final buffered line => last line skipped
+    Stream object line-by-line. Skip first and last line (metadata).
+    Return the set of wanted policy numbers that appear in any data line.
     """
+    print(f"  Searching: {key}", flush=True)
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         body = obj["Body"]
 
-        # Read first line and discard (metadata)
-        it = body.iter_lines(chunk_size=256 * 1024)  # larger chunks = fewer round trips
+        it = body.iter_lines(chunk_size=256 * 1024)
         try:
             next(it)  # discard first line
         except StopIteration:
-            return False  # empty file
+            return set()
 
+        found: set[str] = set()
         prev: Optional[str] = None
 
         for raw in it:
-            # raw is bytes
             line = raw.decode("utf-8", errors="replace")
 
-            # lag-buffer logic: evaluate prev now that we know it's not the last line
             if prev is not None:
-                if line_matches_policy(prev, want):
-                    return True
+                p = policy_in_line(prev)
+                if p is not None and p in want_set:
+                    found.add(p)
 
             prev = line
 
-        # Do NOT evaluate prev here (it is the last line, metadata)
-        return False
+        return found
 
     except botocore.exceptions.ClientError:
-        return False
+        return set()
     except Exception:
-        # Optional: log if you want visibility
-        return False
+        return set()
 
 def iter_txt_keys(s3, bucket: str, prefix: str):
     paginator = s3.get_paginator("list_objects_v2")
@@ -78,6 +75,18 @@ def iter_txt_keys(s3, bucket: str, prefix: str):
                 continue
             yield key
 
+def parse_policy_input(raw: str) -> list[str]:
+    """Parse single policy or comma/newline-separated list; return ordered, deduped list."""
+    parts = raw.replace("\n", ",").split(",")
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        norm = normalize_policy(p.strip())
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
 def main() -> None:
     bucket = input("S3 bucket: ").strip()
     if not bucket:
@@ -85,17 +94,19 @@ def main() -> None:
         return
 
     prefix = input("S3 prefix (folder path, or leave empty): ").strip()
-    policy_number = input("Policy number: ").strip()
+    policy_input = input(
+        "Policy number(s): single value, or comma-separated list: "
+    ).strip()
 
-    want = normalize_policy(policy_number)
-    if not want:
-        print("Policy number is required.")
+    policy_list = parse_policy_input(policy_input)
+    if not policy_list:
+        print("At least one policy number is required.")
         return
 
+    want_set = set(policy_list)
     if prefix and not prefix.endswith("/"):
         prefix += "/"
 
-    #tune these based on your needs, increasing the pool size or worker will increase the speed of the scan, but also increase the memory usage 
     max_workers = int(os.environ.get("S3_SCAN_WORKERS", "32"))
     max_pool = int(os.environ.get("S3_MAX_POOL", "64"))
 
@@ -108,7 +119,6 @@ def main() -> None:
 
     session = boto3.Session(**session_kwargs)
 
-    #Bigger connection pool helps when using threads
     s3 = session.client(
         "s3",
         config=Config(
@@ -117,48 +127,49 @@ def main() -> None:
         ),
     )
 
-    print(f"\nSearching bucket={bucket!r} prefix={prefix!r} for policy {want!r}...\n")
+    print(
+        f"\nSearching bucket={bucket!r} prefix={prefix!r} for {len(policy_list)} policy(s)...\n"
+    )
 
-    matching: list[str] = []
+    results_by_policy: dict[str, list[str]] = {p: [] for p in policy_list}
     scanned = 0
-
-    #keep the number of in-flight futures bounded so memory doesn't grow with huge prefixes
     inflight_limit = max_workers * 4
     futures = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         for key in iter_txt_keys(s3, bucket, prefix):
             scanned += 1
-            fut = ex.submit(object_contains_policy_streaming, s3, bucket, key, want)
+            fut = ex.submit(object_matching_policies_streaming, s3, bucket, key, want_set)
             futures[fut] = key
 
             if len(futures) >= inflight_limit:
                 for done in as_completed(list(futures.keys())[:max_workers]):
                     k = futures.pop(done)
                     try:
-                        if done.result():
-                            matching.append(k)
-                            print(f"  Match: {k}")
+                        for pol in done.result():
+                            results_by_policy[pol].append(k)
                     except Exception:
-                        pass #treat worker error as no match
+                        pass
 
-        #drain remaining
         for done in as_completed(futures):
             k = futures.pop(done)
             try:
-                if done.result():
-                    matching.append(k)
-                    print(f"  Match: {k}")
+                for pol in done.result():
+                    results_by_policy[pol].append(k)
             except Exception:
                 pass
 
-    print(f"\nScanned {scanned} .txt objects.")
-    if matching:
-        print(f"Found {len(matching)} file(s) containing policy {want!r} in positions 6–23:")
-        for k in matching:
-            print(k)
-    else:
-        print(f"No files found with policy {want!r} in positions 6–23.")
+    print(f"\nScanned {scanned} .txt objects.\n")
+    print("--- Results by policy ---")
+    for pol in policy_list:
+        files = results_by_policy[pol]
+        print(f"\nPolicy {pol}:")
+        if files:
+            for f in files:
+                print(f"  {f}")
+            print(f"  ({len(files)} file(s))")
+        else:
+            print("  (no files found)")
 
 if __name__ == "__main__":
     main()
