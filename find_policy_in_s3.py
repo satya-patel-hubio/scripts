@@ -9,6 +9,7 @@ Fast S3 scan: find .txt objects where any *data* line has policy number(s) in co
 
 from __future__ import annotations
 
+import argparse
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -89,7 +90,7 @@ def parse_policy_input(raw: str) -> list[str]:
             out.append(norm)
     return out
 
-def main() -> None:
+def main(*, save_report: bool = False) -> None:
     bucket = input("S3 bucket: ").strip()
     if not bucket:
         print("Bucket is required.")
@@ -164,40 +165,49 @@ def main() -> None:
     print(f"\nScanned {scanned} .txt objects.\n")
     print("--- Results by policy ---")
 
-    report_lines = [
-        f"S3 policy scan report — {datetime.now().isoformat(timespec='seconds')}",
-        f"Bucket: {bucket!r}  Prefix: {prefix!r}",
-        f"Policies: {', '.join(policy_list)}",
-        f"Scanned {scanned} .txt objects.",
-        "",
-        "--- Results by policy ---",
-    ]
+    report_lines: list[str] = []
+    if save_report:
+        report_lines = [
+            f"S3 policy scan report — {datetime.now().isoformat(timespec='seconds')}",
+            f"Bucket: {bucket!r}  Prefix: {prefix!r}",
+            f"Policies: {', '.join(policy_list)}",
+            f"Scanned {scanned} .txt objects.",
+            "",
+            "--- Results by policy ---",
+        ]
     for pol in policy_list:
         files = results_by_policy[pol]
         print(f"\nPolicy {pol}:")
-        report_lines.append(f"\nPolicy {pol}:")
+        if save_report:
+            report_lines.append(f"\nPolicy {pol}:")
         if files:
             for f in files:
                 print(f"  {f}")
-                report_lines.append(f"  {f}")
+                if save_report:
+                    report_lines.append(f"  {f}")
             print(f"  ({len(files)} file(s))")
-            report_lines.append(f"  ({len(files)} file(s))")
+            if save_report:
+                report_lines.append(f"  ({len(files)} file(s))")
         else:
             print("  (no files found)")
-            report_lines.append("  (no files found)")
+            if save_report:
+                report_lines.append("  (no files found)")
 
-    report_text = "\n".join(report_lines)
-    out_dir = Path.home() / "Downloads"
-    if not out_dir.is_dir():
-        out_dir = Path.cwd()
-    out_path = out_dir / f"policy_scan_report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
-    try:
-        out_path.write_text(report_text, encoding="utf-8")
-        print(f"\nReport saved: {out_path}")
-    except OSError:
-        fallback = Path.cwd() / out_path.name
-        fallback.write_text(report_text, encoding="utf-8")
-        print(f"\nReport saved (Downloads unavailable): {fallback}")
+    if save_report:
+        report_text = "\n".join(report_lines)
+        out_dir = Path.home() / "Downloads"
+        if not out_dir.is_dir():
+            out_dir = Path.cwd()
+        out_path = out_dir / f"policy_scan_report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        try:
+            out_path.write_text(report_text, encoding="utf-8")
+            print(f"\nReport saved: {out_path}")
+        except OSError:
+            fallback = Path.cwd() / out_path.name
+            fallback.write_text(report_text, encoding="utf-8")
+            print(f"\nReport saved (Downloads unavailable): {fallback}")
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="Find policy number(s) in S3 .txt objects.")
+    p.add_argument("--save", action="store_true", help="Save report to Downloads folder")
+    main(save_report=p.parse_args().save)
